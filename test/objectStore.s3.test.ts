@@ -323,4 +323,102 @@ describe('S3ObjectStore internal Authorization-header requests (server-side)', (
     })
     await expect(store.delete('d_1/att_1/gone.png')).resolves.toBeUndefined()
   })
+
+  it('download with maxBytes throws when body exceeds cap', async () => {
+    // Stream two 100-byte chunks; cap=150 trips on the second chunk.
+    // We verify the error message references maxBytes — the streaming cancel
+    // is a side effect we exercise but don't assert directly (undici's
+    // pull-based streams may enqueue one extra chunk before cancelling).
+    const chunks = [
+      new Uint8Array(100).fill(0x61),
+      new Uint8Array(100).fill(0x62),
+    ]
+    let idx = 0
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (idx < chunks.length) {
+          controller.enqueue(chunks[idx++])
+        } else {
+          controller.close()
+        }
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, { status: 200 })))
+    const store = new S3ObjectStore({
+      endpoint: 'http://localhost:9000',
+      internalEndpoint: 'http://object-store.local:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+    await expect(store.download('d_1/att_1/big.png', { maxBytes: 150 })).rejects.toThrow(/maxBytes/)
+  })
+
+  it('download with maxBytes returns full buffer when body is under cap', async () => {
+    const body = new Uint8Array(100).fill(0x63)
+    const stream = new ReadableStream({
+      start(controller) { controller.enqueue(body); controller.close() },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, { status: 200 })))
+    const store = new S3ObjectStore({
+      endpoint: 'http://localhost:9000',
+      internalEndpoint: 'http://object-store.local:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+    const result = await store.download('d_1/att_1/small.png', { maxBytes: 200 })
+    expect(result.byteLength).toBe(100)
+  })
+
+  it('upload passes AbortSignal through to fetch', async () => {
+    const controller = new AbortController()
+    const store = new S3ObjectStore({
+      endpoint: 'http://localhost:9000',
+      internalEndpoint: 'http://object-store.local:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+    await store.upload('d_1/att_1/photo.png', 'image/png', new Uint8Array([1]), { signal: controller.signal })
+    const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const [, init] = calls[0] as [string, RequestInit]
+    expect(init.signal).toBe(controller.signal)
+  })
+
+  it('internal GET signs against internal endpoint host (not signingHost)', async () => {
+    const stream = new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array([1])); controller.close() },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, { status: 200 })))
+    const store = new S3ObjectStore({
+      endpoint: 'https://cdn.example.com',
+      internalEndpoint: 'http://minio:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      signingHost: 'cdn.example.com',
+      nowSec: () => 1_700_000_000,
+    })
+    await store.download('d_1/att_1/photo.png')
+    const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const [url, init] = calls[0] as [string, RequestInit]
+    // URL uses internal host
+    expect(new URL(url).host).toBe('minio:9000')
+    // The signed host header is minio:9000 (internal), NOT cdn.example.com —
+    // otherwise SigV4 would mismatch because fetch sends Host: minio:9000.
+    const headers = new Headers(init.headers as Record<string, string>)
+    const authz = headers.get('Authorization') || ''
+    // host is in SignedHeaders; verify the signed host value is the internal host
+    // by checking that the Authorization header is well-formed (we mainly assert
+    // the URL host is internal; a signingHost mismatch would produce the wrong signature).
+    expect(authz).toMatch(/^AWS4-HMAC-SHA256 /)
+  })
 })

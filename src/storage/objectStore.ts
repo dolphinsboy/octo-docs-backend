@@ -40,9 +40,13 @@ export interface ObjectStore {
   presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string
   delete(objectKey: string): Promise<void>
   /** Server-side direct upload (PUT bytes). Uses internal endpoint when configured. */
-  upload(objectKey: string, mime: string, body: Uint8Array): Promise<void>
-  /** Server-side direct download (GET bytes). Uses internal endpoint when configured. */
-  download(objectKey: string): Promise<Uint8Array>
+  upload(objectKey: string, mime: string, body: Uint8Array, opts?: { signal?: AbortSignal }): Promise<void>
+  /**
+   * Server-side direct download (GET bytes). Uses internal endpoint when configured.
+   * When `maxBytes` is set, reads the response as a stream and aborts past the cap,
+   * preventing oversized objects from being fully buffered in memory (OOM defence).
+   */
+  download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array>
 }
 
 export interface PresignGetOptions {
@@ -249,10 +253,13 @@ export class LocalHmacObjectStore implements ObjectStore {
     await getLocalBlobStore().put(applyKeyPrefix(this.keyPrefix, objectKey), mime, Buffer.from(body))
   }
 
-  async download(objectKey: string): Promise<Uint8Array> {
+  async download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array> {
     const { getLocalBlobStore } = await import('./localBlobStore.js')
     const stored = await getLocalBlobStore().get(applyKeyPrefix(this.keyPrefix, objectKey))
     if (!stored) throw new Error(`object not found: ${objectKey}`)
+    if (opts?.maxBytes !== undefined && stored.bytes.length > opts.maxBytes) {
+      throw new Error(`downloaded object exceeds maxBytes cap: ${stored.bytes.length} > ${opts.maxBytes}`)
+    }
     return new Uint8Array(stored.bytes)
   }
 
@@ -555,28 +562,33 @@ export class S3ObjectStore implements ObjectStore {
     await this.internalRequest('DELETE', objectKey)
   }
 
-  async upload(objectKey: string, mime: string, body: Uint8Array): Promise<void> {
-    await this.internalRequest('PUT', objectKey, { mime, body })
+  async upload(objectKey: string, mime: string, body: Uint8Array, opts?: { signal?: AbortSignal }): Promise<void> {
+    await this.internalRequest('PUT', objectKey, { mime, body, signal: opts?.signal })
   }
 
-  async download(objectKey: string): Promise<Uint8Array> {
-    return this.internalRequest('GET', objectKey)
+  async download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array> {
+    return this.internalRequest('GET', objectKey, { maxBytes: opts?.maxBytes })
   }
 
   /**
    * Issue a signed SigV4 Authorization-header request against the internal
    * (container-network) endpoint. PUT takes a mime+body; GET returns the response
-   * bytes as Uint8Array; DELETE returns void (404 tolerated).
+   * bytes as Uint8Array (with streaming cap when maxBytes is set); DELETE returns
+   * void (404 tolerated).
    */
   private async internalRequest(
     method: 'PUT' | 'GET' | 'DELETE',
     objectKey: string,
-    opts?: { mime?: string; body?: Uint8Array },
+    opts?: { mime?: string; body?: Uint8Array; maxBytes?: number; signal?: AbortSignal },
   ): Promise<Uint8Array> {
     const physicalKey = applyKeyPrefix(this.keyPrefix, objectKey)
     const url = new URL(this.internalEndpoint)
     const host = url.host
-    const signedHost = this.signingHost || host
+    // Internal requests go to the container-network endpoint; the Host header
+    // seen by S3/MinIO is the URL host (fetch forbids overriding Host), so sign
+    // against that host directly — `signingHost` (CDN/custom-domain override)
+    // only applies to browser-facing presigned URLs.
+    const signedHost = host
     const canonicalUri = this.canonicalUri(physicalKey)
 
     const now = new Date(this.nowSec() * 1000)
@@ -635,6 +647,7 @@ export class S3ObjectStore implements ObjectStore {
       method,
       headers: fetchHeaders,
       body: method === 'PUT' && opts?.body ? Buffer.from(opts.body) : undefined,
+      signal: opts?.signal,
     })
 
     if (!response.ok) {
@@ -644,7 +657,32 @@ export class S3ObjectStore implements ObjectStore {
     }
 
     if (method === 'GET') {
-      return new Uint8Array(await response.arrayBuffer())
+      // Streaming read with optional byte cap: abort the reader past maxBytes so
+      // an oversized object (e.g. stale/understated sizeBytes row) never fully
+      // buffers in memory — mirrors the old readCapped() defence.
+      if (!response.body) return new Uint8Array()
+      const maxBytes = opts?.maxBytes
+      const reader = response.body.getReader()
+      const chunks: Uint8Array[] = []
+      let total = 0
+      try {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value) {
+            total += value.byteLength
+            if (maxBytes !== undefined && total > maxBytes) {
+              await reader.cancel().catch(() => {})
+              throw new Error(`internal GET ${objectKey} exceeds maxBytes cap: ${total} > ${maxBytes}`)
+            }
+            chunks.push(value)
+          }
+        }
+      } catch (err) {
+        await reader.cancel().catch(() => {})
+        throw err
+      }
+      return Buffer.concat(chunks.map(c => Buffer.from(c)))
     }
     return new Uint8Array()
   }

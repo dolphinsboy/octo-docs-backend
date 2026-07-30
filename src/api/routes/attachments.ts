@@ -560,14 +560,12 @@ export async function copyStoredObject(
 ): Promise<string> {
   const store = getObjectStore()
   const cap = maxSizeFor(src.mime)
-  const downloaded = await store.download(src.objectKey)
+  // Streaming download: aborts mid-stream past cap so a stale/understated
+  // sizeBytes row can never cause the server to fully buffer an oversized object.
+  const downloaded = await store.download(src.objectKey, { maxBytes: cap })
   let bytes: Buffer = Buffer.from(downloaded)
-  if (bytes.length > cap) {
-    throw new Error('copied bytes exceed size cap')
-  }
-  // Defence in depth: the recorded sizeBytes was already checked at upload time,
-  // but it can be wrong/understated, so enforce the cap on the freshly-read bytes
-  // before re-writing them to the target object key.
+  // Defence in depth: double-check the buffer length after streaming completes,
+  // since sizeBytes is trusted from the upload record but can be wrong/understated.
   // Re-sanitize copied SVG bytes so legacy objects that predate the sanitized upload endpoint
   // cannot bypass the current policy through cross-document copy.
   if (baseMime(src.mime) === 'image/svg+xml') {

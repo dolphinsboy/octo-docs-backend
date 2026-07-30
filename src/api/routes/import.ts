@@ -511,6 +511,8 @@ export async function importDocxHandler(req: Request, res: Response): Promise<vo
   // MediaUploadCtx mirrors the attachments presign+register flow so embedded
   // images land in the same store/table as a normal upload. Failures degrade
   // in the parser (fileAttachment node) rather than throwing here.
+  // Each PUT carries an AbortSignal so a wedged object store can't pin the
+  // docx-import concurrency slot indefinitely (§DOCX_TIMEOUT).
   const requestCreatedAttachIds: string[] = []
   const uploadCtx: MediaUploadCtx = {
     docId,
@@ -520,7 +522,8 @@ export async function importDocxHandler(req: Request, res: Response): Promise<vo
       const attachId = newAttachId()
       const safeName = sanitizeFileName(fileName)
       const objectKey = `${docId}/${attachId}/${safeName}`
-      await getObjectStore().upload(objectKey, mime, new Uint8Array(bytes))
+      const signal = AbortSignal.timeout(config.docxImport.timeoutMs)
+      await getObjectStore().upload(objectKey, mime, new Uint8Array(bytes), { signal })
       try {
         await docAttachmentRepo.register({
           attachId,
