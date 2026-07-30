@@ -107,7 +107,8 @@ export async function uploadExcalidrawAttachment(docId: string, uid: string, byt
   const safeName = fileName.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 96) || 'image'
   const objectKey = `${docId}/${attachId}/${safeName}`
   try {
-    await getObjectStore().upload(objectKey, mime, new Uint8Array(bytes))
+    const signal = AbortSignal.timeout(config.docxImport.timeoutMs)
+    await getObjectStore().upload(objectKey, mime, new Uint8Array(bytes), { signal })
   } catch {
     throw new ExcalidrawImportError('upload_failed', 502)
   }
