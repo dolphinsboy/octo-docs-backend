@@ -392,7 +392,7 @@ describe('S3ObjectStore internal Authorization-header requests (server-side)', (
     expect(init.signal).toBe(controller.signal)
   })
 
-  it('internal GET signs against internal endpoint host (not signingHost)', async () => {
+  it('internal GET signs against internal endpoint host when distinct from public', async () => {
     const stream = new ReadableStream({
       start(controller) { controller.enqueue(new Uint8Array([1])); controller.close() },
     })
@@ -412,13 +412,65 @@ describe('S3ObjectStore internal Authorization-header requests (server-side)', (
     const [url, init] = calls[0] as [string, RequestInit]
     // URL uses internal host
     expect(new URL(url).host).toBe('minio:9000')
-    // The signed host header is minio:9000 (internal), NOT cdn.example.com —
-    // otherwise SigV4 would mismatch because fetch sends Host: minio:9000.
     const headers = new Headers(init.headers as Record<string, string>)
-    const authz = headers.get('Authorization') || ''
-    // host is in SignedHeaders; verify the signed host value is the internal host
-    // by checking that the Authorization header is well-formed (we mainly assert
-    // the URL host is internal; a signingHost mismatch would produce the wrong signature).
-    expect(authz).toMatch(/^AWS4-HMAC-SHA256 /)
+    expect(headers.get('Authorization')).toMatch(/^AWS4-HMAC-SHA256 /)
+  })
+
+  it('internal request uses signingHost when internal endpoint equals public (COS/CDN fallback)', async () => {
+    // When no distinct internal endpoint is configured (single-network/CDN proxy
+    // case), the request traverses a CDN that rewrites Host to the origin bucket;
+    // signingHost must be used for SigV4 to match.
+    const authzOf = async (signingHost: string | undefined) => {
+      const stream = new ReadableStream({
+        start(controller) { controller.enqueue(new Uint8Array([1])); controller.close() },
+      })
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, { status: 200 })))
+      const store = new S3ObjectStore({
+        endpoint: 'https://cdn.example.com',
+        // no internalEndpoint → falls back to public endpoint
+        region: 'us-east-1',
+        bucket: 'octo-docs-attachments',
+        accessKeyId: 'minio',
+        secretAccessKey: 'test-secret-key',
+        signingHost,
+        nowSec: () => 1_700_000_000,
+      })
+      await store.download('d_1/att_1/photo.png')
+      const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+      const [, init] = calls[calls.length - 1] as [string, RequestInit]
+      return new Headers(init.headers as Record<string, string>).get('Authorization')!
+    }
+    // With signingHost set the signature must differ from without (host signed vs signingHost signed).
+    const withHost = await authzOf('origin.example.com')
+    const withoutHost = await authzOf(undefined)
+    expect(withHost).not.toBe(withoutHost)
+  })
+
+  it('signingHost does not affect internal-path signature when a distinct internal endpoint is set', async () => {
+    // When internalEndpoint differs from the public endpoint the request goes
+    // directly to S3/MinIO (no Host-rewriting proxy), so signingHost must NOT
+    // appear in the Authorization header — two stores differing only in
+    // signingHost must produce identical internal-path signatures.
+    const authzOf = async (signingHost: string | undefined) => {
+      const stream = new ReadableStream({
+        start(controller) { controller.enqueue(new Uint8Array([1])); controller.close() },
+      })
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, { status: 200 })))
+      const store = new S3ObjectStore({
+        endpoint: 'https://cdn.example.com',
+        internalEndpoint: 'http://minio:9000',
+        region: 'us-east-1',
+        bucket: 'octo-docs-attachments',
+        accessKeyId: 'minio',
+        secretAccessKey: 'test-secret-key',
+        signingHost,
+        nowSec: () => 1_700_000_000,
+      })
+      await store.upload('d/a/p.png', 'image/png', new Uint8Array([1]))
+      const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+      const [, init] = calls[calls.length - 1] as [string, RequestInit]
+      return new Headers(init.headers as Record<string, string>).get('Authorization')!
+    }
+    expect(await authzOf('cdn.example.com')).toBe(await authzOf(undefined))
   })
 })

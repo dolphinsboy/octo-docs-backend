@@ -584,11 +584,14 @@ export class S3ObjectStore implements ObjectStore {
     const physicalKey = applyKeyPrefix(this.keyPrefix, objectKey)
     const url = new URL(this.internalEndpoint)
     const host = url.host
-    // Internal requests go to the container-network endpoint; the Host header
-    // seen by S3/MinIO is the URL host (fetch forbids overriding Host), so sign
-    // against that host directly — `signingHost` (CDN/custom-domain override)
-    // only applies to browser-facing presigned URLs.
-    const signedHost = host
+    // When a distinct internal endpoint is configured the request goes directly
+    // to S3/MinIO (no Host-rewriting proxy), so sign against that host. When no
+    // internal endpoint is set we fall through to the public endpoint, which in
+    // COS-behind-CDN deployments rewrites Host to the origin bucket before SigV4
+    // validation — so keep signing against `signingHost` (same as presign URLs).
+    const signedHost = this.internalEndpoint !== this.endpoint
+      ? host
+      : (this.signingHost || host)
     const canonicalUri = this.canonicalUri(physicalKey)
 
     const now = new Date(this.nowSec() * 1000)

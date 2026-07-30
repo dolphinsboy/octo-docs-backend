@@ -564,8 +564,6 @@ export async function copyStoredObject(
   // sizeBytes row can never cause the server to fully buffer an oversized object.
   const downloaded = await store.download(src.objectKey, { maxBytes: cap })
   let bytes: Buffer = Buffer.from(downloaded)
-  // Defence in depth: double-check the buffer length after streaming completes,
-  // since sizeBytes is trusted from the upload record but can be wrong/understated.
   // Re-sanitize copied SVG bytes so legacy objects that predate the sanitized upload endpoint
   // cannot bypass the current policy through cross-document copy.
   if (baseMime(src.mime) === 'image/svg+xml') {
