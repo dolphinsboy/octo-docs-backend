@@ -630,9 +630,6 @@ export class S3ObjectStore implements ObjectStore {
       ...headers,
       Authorization: authorization,
     }
-    if (method === 'PUT' && opts?.mime) {
-      fetchHeaders['Content-Type'] = opts.mime
-    }
 
     const response = await fetch(requestUrl, {
       method,

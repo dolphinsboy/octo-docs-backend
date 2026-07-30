@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { S3ObjectStore } from '../src/storage/objectStore.js'
 
 // Deterministic clock so the embedded X-Amz-Date (and thus the signature) is
@@ -247,5 +247,80 @@ describe('S3ObjectStore custom-domain / virtual-hosted addressing (COS)', () => 
     expect(url.searchParams.get('X-Amz-Signature')).not.toBe(
       plain.searchParams.get('X-Amz-Signature'),
     )
+  })
+})
+
+describe('S3ObjectStore internal Authorization-header requests (server-side)', () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 200 })),
+    )
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.clearAllMocks()
+  })
+
+  it('upload uses internal endpoint, carries Authorization header, no duplicate content-type', async () => {
+    const store = new S3ObjectStore({
+      endpoint: 'http://localhost:9000',
+      internalEndpoint: 'http://object-store.local:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+    await store.upload('d_1/att_1/photo.png', 'image/png', new Uint8Array([1, 2, 3]))
+
+    const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+    expect(calls).toHaveLength(1)
+    const [url, init] = calls[0] as [string, RequestInit]
+    expect(new URL(url).host).toBe('object-store.local:9000')
+    const headers = new Headers(init.headers as Record<string, string>)
+    expect(headers.get('Authorization')).toMatch(/^AWS4-HMAC-SHA256 /)
+    expect(headers.get('x-amz-content-sha256')).toBeTruthy()
+    // content-type appears exactly once (no duplicate merging).
+    expect(headers.get('content-type')).toBe('image/png')
+    expect(headers.get('Content-Type')).toBe('image/png')
+  })
+
+  it('upload falls back to public endpoint when internalEndpoint is unset', async () => {
+    const store = storeAt(1_700_000_000)
+    await store.upload('d_1/att_1/photo.png', 'image/png', new Uint8Array([1]))
+
+    const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+    expect(calls).toHaveLength(1)
+    const [url] = calls[0] as [string, RequestInit]
+    expect(new URL(url).host).toBe('localhost:9000')
+  })
+
+  it('presignPut still returns public endpoint URL (browser path unchanged)', () => {
+    const store = new S3ObjectStore({
+      endpoint: 'http://localhost:9000',
+      internalEndpoint: 'http://object-store.local:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+    const { uploadUrl } = store.presignPut('d_1/att_1/photo.png', 'image/png', 300)
+    expect(new URL(uploadUrl).host).toBe('localhost:9000')
+  })
+
+  it('delete tolerates 404 without throwing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 404 })))
+    const store = new S3ObjectStore({
+      endpoint: 'http://localhost:9000',
+      internalEndpoint: 'http://object-store.local:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+    await expect(store.delete('d_1/att_1/gone.png')).resolves.toBeUndefined()
   })
 })

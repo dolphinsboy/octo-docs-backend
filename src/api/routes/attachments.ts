@@ -565,12 +565,9 @@ export async function copyStoredObject(
   if (bytes.length > cap) {
     throw new Error('copied bytes exceed size cap')
   }
-  // Defence in depth: the recorded sizeBytes was already checked by the caller,
-  // but it can be wrong/understated, so bound the ACTUAL transfer instead of
-  // materializing an arbitrarily large object first. Reject early on a
-  // Content-Length that exceeds the tier cap, then read the stream chunk by
-  // chunk and abort the moment the accumulated size crosses the cap — the
-  // oversized body is never fully buffered in memory.
+  // Defence in depth: the recorded sizeBytes was already checked at upload time,
+  // but it can be wrong/understated, so enforce the cap on the freshly-read bytes
+  // before re-writing them to the target object key.
   // Re-sanitize copied SVG bytes so legacy objects that predate the sanitized upload endpoint
   // cannot bypass the current policy through cross-document copy.
   if (baseMime(src.mime) === 'image/svg+xml') {
