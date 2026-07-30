@@ -520,20 +520,10 @@ export async function importDocxHandler(req: Request, res: Response): Promise<vo
       const attachId = newAttachId()
       const safeName = sanitizeFileName(fileName)
       const objectKey = `${docId}/${attachId}/${safeName}`
-      const ttl = config.attachments.uploadUrlTtlSeconds
-      const put = getObjectStore().presignPut(objectKey, mime, ttl)
       // Bound the PUT with a wall-clock timeout: this upload runs while holding a
       // docx-import concurrency slot, so a slow/wedged object store must not pin
       // the slot indefinitely and starve later imports into 503s.
-      const resp = await fetch(put.uploadUrl, {
-        method: 'PUT',
-        body: new Uint8Array(bytes),
-        headers: { 'Content-Type': mime, ...(put.headers ?? {}) },
-        signal: AbortSignal.timeout(config.docxImport.timeoutMs),
-      })
-      if (!resp.ok) {
-        throw new Error(`attachment upload failed: ${resp.status}`)
-      }
+      await getObjectStore().upload(objectKey, mime, new Uint8Array(bytes))
       try {
         await docAttachmentRepo.register({
           attachId,
