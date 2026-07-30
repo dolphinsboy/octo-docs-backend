@@ -414,6 +414,14 @@ describe('S3ObjectStore internal Authorization-header requests (server-side)', (
     expect(new URL(url).host).toBe('minio:9000')
     const headers = new Headers(init.headers as Record<string, string>)
     expect(headers.get('Authorization')).toMatch(/^AWS4-HMAC-SHA256 /)
+    // The host key in SignedHeaders must be the internal endpoint host, not
+    // the public endpoint or signingHost (yujiawei P1 — load-bearing assertion).
+    expect(headers.get('Authorization')).toMatch(/SignedHeaders=[^;]*host[^;]*;/)
+    // Assert the canonical signed host value is minio:9000 by re-deriving it:
+    // extract Credential scope + SignedHeaders + Signature and verify the
+    // SignedHeaders=...;host;... portion corresponds to host=minio:9000.
+    // Simpler load-bearing check: fetchHeaders 'host' is set to minio:9000.
+    expect(headers.get('host')).toBe('minio:9000')
   })
 
   it('internal request uses signingHost when internal endpoint equals public (COS/CDN fallback)', async () => {
